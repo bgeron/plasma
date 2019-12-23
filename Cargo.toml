@@ -3,6 +3,14 @@ name = "plasma"
 version = "0.1.0"
 authors = ["Bram Geron <bram@bram.xyz>"]
 edition = "2018"
+description = "An Ion de/serialization library. (Not working yet.)"
+
+keywords = ["serialization", "serde"]
+categories = ["Encoding"]
+
+license = "MIT OR Apache-2.0"
+
+maintenance = { status = "experimental" }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
