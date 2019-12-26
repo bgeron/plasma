@@ -16,3 +16,6 @@ maintenance = { status = "experimental" }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+serde = "1.0.104"
+failure = "0.1.6"
+smallvec = "1.1.0"
