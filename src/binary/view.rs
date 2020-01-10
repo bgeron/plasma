@@ -1,3 +1,4 @@
+use super::DerefU8;
 use super::{ReadError::EndOfStream, Result};
 use crate::imports::*;
 use smallvec::SmallVec;
@@ -53,56 +54,58 @@ pub trait View: Clone {
     /// If Some, then we know that there are at maximum so many bytes in this view, and
     /// reading or skipping past that will be an error. There is no guarantee that so
     /// many bytes will actually be available.
-    fn bound_len(&self) -> Option<usize>;
+    ///
+    /// After bounding, this should be set to Some, and at most the requested bound.
+    fn bound_len(&self) -> Option<u64>;
 
     /// Return the number of bytes that are immediately available, if such knowledge is
     /// available. This may never be more than bound_len.
-    fn hint_available_bytes(&self) -> Option<usize> {
+    fn hint_available_bytes(&self) -> Option<u64> {
         None
     }
 }
 
 pub type SmallVecU8 = smallvec::SmallVec<[u8; 8]>;
 
+/// A view on something which holds onto a `&[u8]`.
 #[derive(Debug, Clone)]
-pub struct BorrowView<T: Clone + Borrow<[u8]>> {
-    handle: T,
+pub struct BorrowView<T: Clone + DerefU8> {
     offset: usize,               // Can never skip beyond memory
     bound_offset: Option<usize>, // Offset of first byte that is not allowed to be read
+    handle: T,
 }
 
-impl<T: Clone + Borrow<[u8]>> BorrowView<T> {
+impl<T: Clone + DerefU8> BorrowView<T> {
     pub fn new(handle: T) -> Self {
         Self::new_offset(handle, 0)
     }
 
     pub fn new_offset(handle: T, offset: usize) -> Self {
         BorrowView {
-            handle,
             offset,
             bound_offset: None,
+            handle,
         }
     }
 }
 
-impl<T: Clone + Borrow<[u8]>> Borrow<[u8]> for BorrowView<T> {
-    fn borrow(&self) -> &[u8] {
-        self.handle.borrow()
-    }
-}
-
-impl<T: Clone + Borrow<[u8]>> View for BorrowView<T> {
+impl<T: Clone + DerefU8> View for BorrowView<T> {
     fn read_byte(&self) -> Result<u8> {
         self.handle
-            .borrow()
+            .deref_u8()
             .get(self.offset)
             .copied()
             .ok_or(EndOfStream)
     }
     fn transcribe(&self, len: usize) -> Result<SmallVecU8> {
+        if let Some(b_off) = self.bound_offset {
+            if self.offset + len > b_off {
+                return Err(EndOfStream);
+            }
+        }
         let slice = self
             .handle
-            .borrow()
+            .deref_u8()
             .get(self.offset..self.offset + len)
             .ok_or(EndOfStream)?;
         Ok(SmallVec::from_slice(slice))
@@ -126,7 +129,15 @@ impl<T: Clone + Borrow<[u8]>> View for BorrowView<T> {
         match (self.bound_offset, usize::try_from(len)) {
             (_, Err(_)) => {} // bound past memory does nothing
 
-            (None, Ok(len2)) => self.bound_offset = Some(self.offset.saturating_add(len2)),
+            (None, Ok(len2)) => {
+                // No bound_offset set; set one now.
+                let proposed_bound_offset = self.offset.saturating_add(len2);
+                if proposed_bound_offset <= self.handle.deref_u8().len() {
+                    self.bound_offset = Some(proposed_bound_offset)
+                } else {
+                    self.bound_offset = Some(len2)
+                }
+            },
 
             (Some(cur), Ok(len2)) => {
                 let suggested_bound_offset = self.offset.saturating_add(len2);
@@ -136,15 +147,71 @@ impl<T: Clone + Borrow<[u8]>> View for BorrowView<T> {
         self
     }
 
-    fn bound_len(&self) -> Option<usize> {
-        Some(self.handle.borrow().len().saturating_sub(self.offset))
+    fn bound_len(&self) -> Option<u64> {
+        Some(self.bound_offset?.saturating_sub(self.offset) as u64)
     }
-    fn hint_available_bytes(&self) -> Option<usize> {
-        Some(self.handle.borrow().len().saturating_sub(self.offset))
+    fn hint_available_bytes(&self) -> Option<u64> {
+        let len = self.handle.deref_u8().len();
+        let available_offset = match self.bound_offset {
+            Some(off) => min(off, len),
+            None => len,
+        };
+        Some(available_offset.saturating_sub(self.offset) as u64)
     }
 }
 
 #[cfg(test)]
 mod test {
-    // todo
+    use super::super::ReadError::EndOfStream;
+    use super::super::*;
+    use super::*;
+    const TWENTYB: &[u8] =
+        b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19";
+
+    #[test]
+    fn test_borrow_view() {
+        #![allow(clippy::redundant_clone)]
+
+        test_particular_borrow_view(BorrowView::new(TWENTYB));
+        test_particular_borrow_view(BorrowView::new(TWENTYB).clone());
+        test_particular_borrow_view(BorrowView::new(Arc::new(TWENTYB)));
+        test_particular_borrow_view(BorrowView::new(Arc::new(TWENTYB)).clone());
+        test_particular_borrow_view(BorrowView::new(Arc::new(TWENTYB.to_vec())));
+        test_particular_borrow_view(BorrowView::new(Arc::new(TWENTYB.to_vec())).clone());
+    }
+    fn test_particular_borrow_view<T: Clone + DerefU8>(mut v: BorrowView<T>) {
+        assert_eq!(v.read_byte().unwrap(), 0);
+        assert_eq!(&*v.transcribe(4).unwrap(), b"\x00\x01\x02\x03");
+        assert_eq!(&*v.transcribe(20).unwrap(), TWENTYB);
+        assert_eq!(v.transcribe(21), Err(EndOfStream));
+        assert_eq!(v.bound_len(), None);
+        assert_eq!(v.hint_available_bytes(), Some(20));
+
+        v = v.bound(20);
+
+        assert_eq!(v.read_byte().unwrap(), 0);
+        assert_eq!(&*v.transcribe(4).unwrap(), b"\x00\x01\x02\x03");
+        assert_eq!(&*v.transcribe(20).unwrap(), TWENTYB);
+        assert_eq!(v.transcribe(21), Err(EndOfStream));
+        assert_eq!(v.bound_len(), Some(20));
+        assert_eq!(v.hint_available_bytes(), Some(20));
+
+        v = v.skip(3).unwrap();
+
+        assert_eq!(v.read_byte(), Ok(3));
+        assert_eq!(&*v.transcribe(3).unwrap(), b"\x03\x04\x05");
+        assert_eq!(&*v.transcribe(4).unwrap(), b"\x03\x04\x05\x06");
+        assert_eq!(v.transcribe(20), Err(EndOfStream));
+        assert_eq!(v.bound_len(), Some(17));
+        assert_eq!(v.hint_available_bytes(), Some(17));
+
+        v = v.bound(3);
+
+        assert_eq!(v.read_byte(), Ok(3));
+        assert_eq!(v.transcribe(4), Err(EndOfStream));
+        assert_eq!(&*v.transcribe(3).unwrap(), b"\x03\x04\x05");
+        assert_eq!(v.transcribe(20), Err(EndOfStream));
+        assert_eq!(v.bound_len(), Some(3));
+        assert_eq!(v.hint_available_bytes(), Some(3));
+    }
 }
